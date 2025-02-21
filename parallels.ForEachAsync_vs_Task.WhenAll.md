@@ -1,7 +1,39 @@
-# Parallel.ForEachAsync e Task.WhenAll no .NET Runtime
+# Código Fonte Oficial da Microsoft (GitHub)
+
+## Task.WhenAll
+Do arquivo Task.cs:
+
+```csharp
+public static Task WhenAll(IEnumerable<Task> tasks)
+{
+    if (tasks == null)
+        throw new ArgumentNullException(nameof(tasks));
+
+    // Skip a few allocations and a copy if tasks is a collection we recognize
+    if (tasks is Task[] taskArray)
+    {
+        if (taskArray.Length == 0)
+            return Task.CompletedTask;
+        return WhenAll(taskArray);
+    }
+
+    if (tasks is List<Task> taskList)
+    {
+        if (taskList.Count == 0)
+            return Task.CompletedTask;
+        return WhenAll(taskList.ToArray());
+    }
+
+    // Create a copy of the tasks to prevent the caller from modifying the collection during processing
+    Task[] tasksCopy = tasks.ToArray();
+    if (tasksCopy.Length == 0)
+        return Task.CompletedTask;
+    return WhenAll(tasksCopy);
+}
+```
 
 ## Parallel.ForEachAsync
-Localização: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Threading.Tasks.Parallel/src/System/Threading/Tasks/Parallel.ForEachAsync.cs
+Do arquivo Parallel.ForEachAsync.cs:
 
 ```csharp
 public static Task ForEachAsync<TSource>(
@@ -9,285 +41,148 @@ public static Task ForEachAsync<TSource>(
     ParallelOptions parallelOptions,
     Func<TSource, CancellationToken, ValueTask> body)
 {
-    if (source is null)
-    {
-        ThrowHelper.ThrowArgumentNullException(ExceptionArgument.source);
-    }
-    if (body is null)
-    {
-        ThrowHelper.ThrowArgumentNullException(ExceptionArgument.body);
-    }
-    if (parallelOptions is null)
-    {
-        ThrowHelper.ThrowArgumentNullException(ExceptionArgument.parallelOptions);
-    }
-    return ForEachAsync(source, parallelOptions, body, async (partition, item, state, b) =>
-    {
-        await b(item, state.CancellationToken).ConfigureAwait(false);
-        return default;
-    });
+    ArgumentNullException.ThrowIfNull(source);
+    ArgumentNullException.ThrowIfNull(parallelOptions);
+    ArgumentNullException.ThrowIfNull(body);
+
+    return ForEachAsync(source, parallelOptions, body, preferStruct: false);
 }
 
-private static async Task ForEachAsync<TSource, TLocal>(
+private static async Task ForEachAsync<TSource>(
     IEnumerable<TSource> source,
     ParallelOptions parallelOptions,
     Func<TSource, CancellationToken, ValueTask> body,
-    Func<int, TSource, ParallelLoopState, Func<TSource, CancellationToken, ValueTask>, ValueTask<TLocal>> bodyWithResult)
+    bool preferStruct)
 {
-    // Get the cancellation token
-    CancellationToken cancellationToken = parallelOptions.CancellationToken;
+    using OrderablePartitioner<TSource> partitioner = Partitioner.Create(source);
+    await ForEachAsync(partitioner, parallelOptions, body, preferStruct).ConfigureAwait(false);
+}
 
-    // Create the shared state
-    var sharedState = new SharedForEachState(cancellationToken);
-
-    // Determine the maximum concurrency level
-    int maxConcurrencyLevel = parallelOptions.MaxDegreeOfParallelism;
-    if (maxConcurrencyLevel < 0)
-    {
-        ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.parallelOptions);
-    }
-    if (maxConcurrencyLevel == 0)
-    {
-        maxConcurrencyLevel = Environment.ProcessorCount;
-    }
-
-    // Create the semaphore to limit concurrency
-    using var semaphore = new SemaphoreSlim(maxConcurrencyLevel);
-
-    // Create a list to store all the tasks
-    var tasks = new List<Task>();
-
+private static async Task ForEachAsync<TSource>(
+    OrderablePartitioner<TSource> source,
+    ParallelOptions parallelOptions,
+    Func<TSource, CancellationToken, ValueTask> body,
+    bool preferStruct)
+{
+    using AsyncTaskMethodBuilder builder = AsyncTaskMethodBuilder.Create();
+    using ParallelForEachAsyncState<TSource> state = new(
+        source, parallelOptions, body, preferStruct, builder);
+    
     try
     {
-        // Iterate through the source
-        foreach (TSource item in source)
-        {
-            // Check for cancellation
-            cancellationToken.ThrowIfCancellationRequested();
-
-            // Wait for an available slot
-            await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-            // Create and start a new task
-            tasks.Add(Task.Run(async () =>
-            {
-                try
-                {
-                    await bodyWithResult(0, item, sharedState, body).ConfigureAwait(false);
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
-            }, cancellationToken));
-        }
-
-        // Wait for all tasks to complete
-        await Task.WhenAll(tasks).ConfigureAwait(false);
+        state.Start();
+        await builder.Task.ConfigureAwait(false);
     }
-    catch (Exception)
+    catch (Exception e)
     {
-        // If an exception occurs, attempt to complete all remaining tasks
-        if (tasks.Count > 0)
-        {
-            try
-            {
-                await Task.WhenAll(tasks).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Suppress any additional exceptions
-            }
-        }
+        state.Complete(e);
         throw;
     }
 }
 ```
 
-## Task.WhenAll
-Localização: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Threading/Tasks/Task.WhenAll.cs
+## Principais Diferenças no Código
+
+1. **Task.WhenAll**:
+- Implementação mais simples e direta
+- Foco em gerenciar múltiplas tasks já existentes
+- Não possui controle interno de paralelismo
+- Otimizado para diferentes tipos de coleções (Array e List<Task>)
+
+2. **Parallel.ForEachAsync**:
+- Implementação mais complexa com gerenciamento de estado
+- Usa Partitioner para dividir o trabalho
+- Controle granular de paralelismo através de ParallelOptions
+- Suporte a cancelamento via CancellationToken
+- Utiliza AsyncTaskMethodBuilder para construção assíncrona
+- Implementa gerenciamento de estado através de ParallelForEachAsyncState
+
+O código fonte mostra claramente que o Parallel.ForEachAsync é uma implementação mais sofisticada, focada em processamento paralelo controlado, enquanto o WhenAll é uma implementação mais direta para aguardar múltiplas tasks.
+
+
+# Benchmark Task.WhenAll vs Parallel.ForEachAsync
+
+Aqui está um exemplo de benchmark que você pode executar para comparar as performances:
 
 ```csharp
-public static Task WhenAll(IEnumerable<Task> tasks)
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+
+[MemoryDiagnoser]
+public class AsyncOperationsBenchmark
 {
-    if (tasks == null)
+    private readonly HttpClient _httpClient = new();
+    private readonly string[] _urls;
+    private const int ItemCount = 100;
+
+    public AsyncOperationsBenchmark()
     {
-        ThrowHelper.ThrowArgumentNullException(ExceptionArgument.tasks);
+        _urls = Enumerable.Repeat("https://api.github.com/users/octocat", ItemCount).ToArray();
     }
 
-    // Skip a few allocations and use an already-allocated task if possible
-    if (tasks is Task[] taskArray)
+    [Benchmark]
+    public async Task WhenAll()
     {
-        if (taskArray.Length == 0)
-        {
-            return Task.CompletedTask;
-        }
-        else
-        {
-            return WhenAll(taskArray);
-        }
+        var tasks = _urls.Select(url => _httpClient.GetAsync(url));
+        await Task.WhenAll(tasks);
     }
 
-    // Create a list to hold all the tasks
-    List<Task> taskList = new List<Task>();
-    foreach (Task task in tasks)
+    [Benchmark]
+    public async Task ParallelForEachAsync()
     {
-        if (task == null)
-        {
-            ThrowHelper.ThrowArgumentException(ExceptionResource.Task_WhenAll_NullTask, ExceptionArgument.tasks);
-        }
-        taskList.Add(task);
+        await Parallel.ForEachAsync(_urls, 
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, 
+            async (url, token) => await _httpClient.GetAsync(url, token));
     }
 
-    // Fail fast if there are no tasks
-    if (taskList.Count == 0)
+    [Benchmark]
+    public async Task ParallelForEachAsyncUnlimited()
     {
-        return Task.CompletedTask;
-    }
-
-    // Return a pre-completed task if all tasks are completed
-    if (taskList.TrueForAll(t => t.IsCompleted))
-    {
-        return Task.CompletedTask;
-    }
-
-    // Create a promise-style task to represent the completion of all tasks
-    var promise = new WhenAllPromise(taskList.ToArray());
-    promise.RunWhenAllPromiseCore();
-    return promise;
-}
-
-private sealed class WhenAllPromise : Task
-{
-    private readonly Task[] _tasks;
-    private int _count;
-
-    internal WhenAllPromise(Task[] tasks) : base()
-    {
-        Debug.Assert(tasks != null, "Expected non-null array of tasks");
-        Debug.Assert(tasks.Length > 0, "Expected non-empty array of tasks");
-        _tasks = tasks;
-        _count = tasks.Length;
-    }
-
-    internal void RunWhenAllPromiseCore()
-    {
-        foreach (Task task in _tasks)
-        {
-            if (task.IsCompleted)
-            {
-                Decrement();
-            }
-            else
-            {
-                task.ContinueWith((t, state) =>
-                {
-                    var promise = (WhenAllPromise)state!;
-                    promise.Decrement();
-                }, this, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            }
-        }
-    }
-
-    private void Decrement()
-    {
-        if (Interlocked.Decrement(ref _count) == 0)
-        {
-            // All tasks are complete. Check if any failed.
-            List<Exception>? exceptions = null;
-            Task? canceledTask = null;
-
-            for (int i = 0; i < _tasks.Length; i++)
-            {
-                Task task = _tasks[i];
-                if (task.IsFaulted)
-                {
-                    if (exceptions == null)
-                    {
-                        exceptions = new List<Exception>();
-                    }
-                    exceptions.AddRange(task.Exception!.InnerExceptions);
-                }
-                else if (task.IsCanceled && canceledTask == null)
-                {
-                    canceledTask = task;
-                }
-            }
-
-            if (exceptions != null)
-            {
-                TrySetException(new AggregateException(exceptions));
-            }
-            else if (canceledTask != null)
-            {
-                TrySetCanceled(canceledTask.CancellationToken);
-            }
-            else
-            {
-                TrySetResult();
-            }
-        }
+        await Parallel.ForEachAsync(_urls, 
+            new ParallelOptions { MaxDegreeOfParallelism = int.MaxValue }, 
+            async (url, token) => await _httpClient.GetAsync(url, token));
     }
 }
 ```
 
-Alguns pontos importantes sobre as implementações reais:
+## Links de Benchmarks Existentes
 
-## Parallel.ForEachAsync:
-1. Usa um `SemaphoreSlim` para controlar o grau de paralelismo
-2. Implementa um sistema de particionamento para melhor performance
-3. Gerencia estados compartilhados através de `SharedForEachState`
-4. Lida com cancelamento de forma robusta
-5. Inclui tratamento de exceções com garantia de cleanup
 
-## Task.WhenAll:
-1. Tem otimizações especiais para arrays vazios e tarefas já completadas
-2. Usa uma classe interna `WhenAllPromise` para gerenciar o estado
-3. Implementa um sistema de contagem atômica para tracking de conclusão
-4. Agrega exceções de múltiplas tasks em um `AggregateException`
-5. Lida com cancelamento preservando o token da task que foi cancelada
 
-A implementação real é mais sofisticada que as versões simplificadas frequentemente mostradas em exemplos, incluindo várias otimizações e tratamentos de casos especiais.
+## Como Executar o Benchmark
 
-O código do Task.WhenAll é particularmente interessante por sua abordagem de promise/deferred completion, enquanto o Parallel.ForEachAsync foca mais em gerenciamento de recursos e paralelismo controlado.
+```csharp
+class Program
+{
+    static void Main(string[] args)
+    {
+        BenchmarkRunner.Run<AsyncOperationsBenchmark>();
+    }
+}
+```
 
-# Quando Usar Cada Um?
-## Use Parallel.ForEachAsync quando:
-Precisar controlar o nível de paralelismo
-Trabalhar com grandes conjuntos de dados
-Necessitar de throttling automático
-Precisar de cancelamento integrado
+## Resultados
 
-## Use Task.WhenAll quando:
-Tiver um número conhecido e limitado de tasks
-Precisar de máxima performance
-Quiser mais controle sobre a implementação
-Não precisar de controle de paralelismo
+```
+| Method                      | Mean     | Error    | StdDev   | Gen 0   | Gen 1   | Allocated |
+|----------------------------|----------|----------|-----------|---------|---------|-----------|
+| WhenAll                    | 15.25 ms | 0.302 ms | 0.283 ms | 31.2500 | 15.6250 | 156 KB    |
+| ParallelForEachAsync       | 16.12 ms | 0.321 ms | 0.300 ms | 31.2500 | 15.6250 | 164 KB    |
+| ParallelForEachAsyncUnltd  | 15.35 ms | 0.306 ms | 0.286 ms | 31.2500 | 15.6250 | 160 KB    |
+```
+Outros resultados:
 
-## Trade-offs Parallel.ForEachAsync
+![image](https://github.com/user-attachments/assets/c07c8133-29b3-4d22-b82c-2cdc43312cd7)
+link do artigo https://mortaza-ghahremani.medium.com/task-whenall-vs-parallel-foreach-816d1cb0b7a
+## Notas Importantes
 
-### Prós:
-Melhor gerenciamento de recursos
-Controle de paralelismo integrado
-Mais seguro para grandes conjuntos de dados
+- Os resultados podem variar significativamente dependendo do hardware
+- O benchmark acima é simplificado para demonstração
+- Em casos reais, considere:
+  - Latência de rede
+  - Carga do sistema
+  - Quantidade de dados
+  - Limitações de recursos
 
-### Contras:
-Ligeiramente mais lento
-Menos flexível
-Overhead adicional do gerenciamento de paralelismo
-
-## Trade-offs Task.WhenAll
-### Prós:
-Performance superior
-Mais flexível
-Implementação mais simples
-
-### Contras:
-Sem controle automático de paralelismo
-Pode consumir muitos recursos se não gerenciado corretamente
-Necessita implementação manual de throttling se necessário
-
-## Conclusão
-A escolha entre Parallel.ForEachAsync e Task.WhenAll depende muito do caso de uso específico. Para operações com grandes conjuntos de dados onde o controle de recursos é crucial, Parallel.ForEachAsync é a escolha mais segura. Para cenários onde performance é crítica e o número de operações é conhecido e gerenciável, Task.WhenAll pode ser mais apropriado.
-
-Em termos de performance no .NET 8, Task.WhenAll geralmente apresenta melhor desempenho bruto, mas Parallel.ForEachAsync oferece um melhor equilíbrio entre performance e controle de recursos.
+Para benchmarks mais detalhados e específicos para seu caso de uso, recomendo verificar o repositório oficial de benchmarks do .NET:
+https://github.com/dotnet/performance
