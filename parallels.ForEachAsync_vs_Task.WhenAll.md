@@ -1,4 +1,4 @@
-# Código Fonte Oficial da Microsoft (GitHub)
+# Task.WhenAll vs Parallel.ForEachAsync (com codigo fonte original microsoft)
 
 
 A te peguei ne, achou que o forEachAsync usava o task when all por baixo dos panos. (ja usou em versoes mais antigas do dotnet, hoje no more)
