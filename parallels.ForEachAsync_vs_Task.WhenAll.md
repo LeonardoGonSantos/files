@@ -1,5 +1,8 @@
 # Código Fonte Oficial da Microsoft (GitHub)
 
+
+A te peguei ne, achou que o forEachAsync usava o task when all por baixo dos panos. (ja usou em versoes mais antigas do dotnet, hoje no more)
+
 ## Task.WhenAll
 Do arquivo Task.cs:
 
