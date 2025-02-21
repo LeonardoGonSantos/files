@@ -96,7 +96,6 @@ private static async Task ForEachAsync<TSource>(
 - Implementação mais complexa com gerenciamento de estado
 - Usa Partitioner para dividir o trabalho
 - Controle granular de paralelismo através de ParallelOptions
-- Suporte a cancelamento via CancellationToken
 - Utiliza AsyncTaskMethodBuilder para construção assíncrona
 - Implementa gerenciamento de estado através de ParallelForEachAsyncState
 
